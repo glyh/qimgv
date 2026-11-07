@@ -339,6 +339,18 @@ void FolderGridView::keyPressEvent(QKeyEvent *event) {
 
     // handle selection
     switch (event->key()) {
+    case Qt::Key_H:
+        selectPrev();
+        break;
+    case Qt::Key_L:
+        selectNext();
+        break;
+    case Qt::Key_K:
+        selectAbove();
+        break;
+    case Qt::Key_J:
+        selectBelow();
+        break;
     case Qt::Key_Left:
         selectPrev();
         break;
