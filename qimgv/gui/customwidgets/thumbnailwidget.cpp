@@ -1,5 +1,7 @@
 #include "thumbnailwidget.h"
 
+#include <QTimer>
+
 ThumbnailWidget::ThumbnailWidget(QGraphicsItem *parent) :
     QGraphicsWidget(parent),
     isLoaded(false),
@@ -26,13 +28,23 @@ ThumbnailWidget::ThumbnailWidget(QGraphicsItem *parent) :
 }
 
 void ThumbnailWidget::updateDpr(qreal newDpr) {
-    if(dpr != newDpr) {
-        dpr = newDpr;
-        if(trunc(dpr) == dpr) // don't enable for fractional scaling
-            setCacheMode(QGraphicsItem::DeviceCoordinateCache);
-        updateThumbnailDrawPosition();
-        updateBackgroundRect();
+    if(dpr == newDpr)
+        return;
+    dpr = newDpr;
+    // paint() calls this, because Wayland only reports the real DPR after the first
+    // paint event. Changing the cache mode here would invalidate the QPixmapCache key
+    // Qt is painting with, and ~QPixmapCache::Key() then runs on a stale key
+    // (segfault inside QGraphicsView::paintEvent -- upstream easymodo/qimgv#512).
+    // Defer the cache-mode change to the next event-loop turn; the QObject context
+    // drops it if the item dies first.
+    if(trunc(dpr) == dpr && cacheMode() != QGraphicsItem::DeviceCoordinateCache) {
+        QTimer::singleShot(0, this, [this] {
+            if(trunc(dpr) == dpr)
+                setCacheMode(QGraphicsItem::DeviceCoordinateCache);
+        });
     }
+    updateThumbnailDrawPosition();
+    updateBackgroundRect();
 }
 
 void ThumbnailWidget::setThumbnailSize(int size) {
