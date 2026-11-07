@@ -83,19 +83,23 @@ rm mpv-x64.7z
 
 # ------------------------------------------------------------------------------
 echo "BUILDING"
-#rm -rf $BUILD_DIR
-sed -i 's|opencv4/||' $SRC_DIR/qimgv/3rdparty/QtOpenCV/cvmatandqimage.{h,cpp}
-cmake -S $SRC_DIR -B $BUILD_DIR -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH=$CUSTOM_QT_DIR \
-    -DOpenCV_DIR=$OPENCV_DIR \
-    -DOPENCV_SUPPORT=ON \
-    -DVIDEO_SUPPORT=ON \
-    -DMPV_DIR=$MPV_DIR \
-    -DCMAKE_CXX_FLAGS="$CFL" -DCMAKE_EXE_LINKER_FLAGS="$LDFL"
-ninja -C $BUILD_DIR
+# NOTE: build.zig drives Qt 6 only (Qt5 support was dropped with the port), but this
+# script still provisions the Qt 5.15.3 tree above and packages Qt5*.dll below, and the
+# imageformat plugins below are still built for Qt5. The Windows backend therefore needs
+# a Qt6/MSYS2 provisioning path before this script produces a working package; that is
+# tracked separately as a CI-backend ticket. Linux and macOS are unaffected.
+# The build system is build.zig now (CMake was retired). zig is the driver; the C++
+# compile uses the toolchain's clang++/g++ because zig 0.17's frontend cannot parse a
+# modern libstdc++, see the comment at the top of build.zig.
+if ! command -v zig >/dev/null; then
+    echo "zig is required: install it (pacman -S zig) and re-run" >&2
+    exit 1
+fi
+# OPENCV in the packaged layout is a prebuilt 4.5.5 tree; build.zig reaches it through
+# pkg-config, so point pkg-config at it before building.
+export PKG_CONFIG_PATH="$OPENCV_DIR/x64/mingw/lib/pkgconfig:$PKG_CONFIG_PATH"
+zig build -Doptimize=ReleaseFast -Dopencv=true -Dvideo=true --prefix "$BUILD_DIR/install"
 
-# ------------------------------------------------------------------------------
 echo "BUILDING IMAGEFORMATS"
 # We are using libjxl from MSYS2 but feel free to compile instead
 #cd $EXT_DIR
@@ -171,10 +175,10 @@ rm -rf $PACKAGE_DIR
 mkdir $PACKAGE_DIR
 
 # 1 - copy qimgv build
-cp $BUILD_DIR/qimgv/qimgv.exe $PACKAGE_DIR
-mkdir $PACKAGE_DIR/plugins
-cp $BUILD_DIR/plugins/player_mpv/player_mpv.dll $PACKAGE_DIR/plugins
-cp -r $BUILD_DIR/qimgv/translations/ $PACKAGE_DIR/
+cp $BUILD_DIR/install/bin/qimgv.exe $PACKAGE_DIR
+mkdir -p $PACKAGE_DIR/plugins
+cp $BUILD_DIR/install/bin/plugins/player_mpv.dll $PACKAGE_DIR/plugins
+cp -r $BUILD_DIR/install/bin/translations/ $PACKAGE_DIR/
 
 # 2 - copy qt dlls
 cd $CUSTOM_QT_DIR/bin
