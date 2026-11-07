@@ -33,12 +33,12 @@ The parquet pins are the Hugging Face **LFS oids**, and both were re-verified af
 4. Verify the CLIC zip, extract, then generate the WebP layer with `magick -quality 80` on the sorted PNGs and check the manifest digest.
 5. Verify the 100 MP file against its hash.
 
-Scripts used: `/tmp/wf/fetch_coco_tail.py`, `/tmp/wf/extract_coco.py`.
+Scripts: `docs/research/bench-corpus/fetch_coco_tail.py`, `extract_coco.py`, `webp-sha256.txt` (same copies live in `/var/tmp/qimgv-bench/scripts/`).
 
 ## Layout
 
 ```
-/tmp/wf/corpus/
+/var/tmp/qimgv-bench/
 ├── coco5000/     4 952 JPEG   ~0.3 MP each    <- W1: the folder-open spine
 ├── ladder/          13 JPG    6.9-51.1 MP     <- decode cost vs resolution
 ├── clic/            30 PNG    ~3 MP           <- format/lossless layer
