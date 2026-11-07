@@ -1,6 +1,5 @@
 .kdev4/
 *.txt
-!CMakeLists.txt
 !msys2-build-deps.txt
 !msys2-dll-deps.txt
 #build*
@@ -19,3 +18,5 @@ release/
 *.user
 ui_settingsdialog.h
 Makefile
+.zig-cache/
+zig-out/
