@@ -265,32 +265,45 @@ fn scanSources(
     while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
 
+        // The walker joins components with the native separator, so on Windows
+        // entry.path is a backslash-separated path. Every test below -- the skip
+        // component list, the "watchers/linux/" match, dead_sources, and the object
+        // names tuName derives from rel -- is written with '/'. Normalise once here;
+        // the raw entry.path is still what the filesystem calls below use.
+        const path = blk: {
+            const normalised = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
+            for (normalised) |*c| {
+                if (c.* == '\\') c.* = '/';
+            }
+            break :blk normalised;
+        };
+
         var skipped = false;
-        var parts = std.mem.tokenizeScalar(u8, entry.path, '/');
+        var parts = std.mem.tokenizeScalar(u8, path, '/');
         while (parts.next()) |part| {
             for (skip) |s| if (std.mem.eql(u8, part, s)) {
                 skipped = true;
             };
         }
-        if (!is_windows and std.mem.indexOf(u8, entry.path, "watchers/windows/") != null) skipped = true;
+        if (!is_windows and std.mem.indexOf(u8, path, "watchers/windows/") != null) skipped = true;
         // The Linux watcher is inotify-only (sys/inotify.h). CMake compiled no watcher at
         // all on Apple -- its APPLE branch is commented out and directorywatcher.cpp falls
         // back to DummyWatcher -- so macOS must not pick this one up.
-        if ((is_windows or is_macos) and std.mem.indexOf(u8, entry.path, "watchers/linux/") != null) skipped = true;
-        for (dead_sources) |dead| if (std.mem.eql(u8, entry.path, dead)) {
+        if ((is_windows or is_macos) and std.mem.indexOf(u8, path, "watchers/linux/") != null) skipped = true;
+        for (dead_sources) |dead| if (std.mem.eql(u8, path, dead)) {
             skipped = true;
         };
         if (skipped) continue;
 
-        const rel = b.fmt("{s}/{s}", .{ root, entry.path });
-        if (std.mem.endsWith(u8, entry.path, ".cpp")) {
+        const rel = b.fmt("{s}/{s}", .{ root, path });
+        if (std.mem.endsWith(u8, path, ".cpp")) {
             cpp.append(b.allocator, b.dupe(rel)) catch @panic("OOM");
-        } else if (std.mem.endsWith(u8, entry.path, ".ui")) {
+        } else if (std.mem.endsWith(u8, path, ".ui")) {
             ui.append(b.allocator, b.dupe(rel)) catch @panic("OOM");
         }
-        if (!std.mem.endsWith(u8, entry.path, ".h") and
-            !std.mem.endsWith(u8, entry.path, ".hpp") and
-            !std.mem.endsWith(u8, entry.path, ".cpp")) continue;
+        if (!std.mem.endsWith(u8, path, ".h") and
+            !std.mem.endsWith(u8, path, ".hpp") and
+            !std.mem.endsWith(u8, path, ".cpp")) continue;
 
         const text = dir.readFileAlloc(io, entry.path, b.allocator, .limited(4 << 20)) catch continue;
         if (std.mem.indexOf(u8, text, "Q_OBJECT") != null or std.mem.indexOf(u8, text, "Q_GADGET") != null) {
@@ -399,7 +412,9 @@ fn resolveInclude(b: *std.Build, from_rel: []const u8, name: []const u8) ?[]cons
 /// Cache/staging name for a moc output: `gui/mainwindow.h` -> `gui_mainwindow`.
 fn tuName(b: *std.Build, rel: []const u8) []const u8 {
     const base = if (std.mem.endsWith(u8, rel, ".cpp")) rel[0 .. rel.len - 4] else std.fs.path.stem(rel);
-    return std.mem.replaceOwned(u8, b.allocator, base, "/", "_") catch @panic("OOM");
+    const slashed = std.mem.replaceOwned(u8, b.allocator, base, "/", "_") catch @panic("OOM");
+    // A surviving separator would become a subdirectory of the cache entry.
+    return std.mem.replaceOwned(u8, b.allocator, slashed, "\\", "_") catch @panic("OOM");
 }
 
 /// moc needs the include and define flags of the TU it serves, nothing else.
