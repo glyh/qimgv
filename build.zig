@@ -167,7 +167,12 @@ pub fn build(b: *std.Build) void {
     if (with_exiv2) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"exiv2"})) catch @panic("OOM");
     if (with_opencv) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"opencv4"})) catch @panic("OOM");
     if (with_kde) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"KF6WindowSystem"})) catch @panic("OOM");
-    if (is_windows) add(&link_flags, b.allocator, &.{"-mwindows", "-Wl,--subsystem,windows"}) catch @panic("OOM");
+    if (is_windows) {
+        add(&link_flags, b.allocator, &.{"-mwindows", "-Wl,--subsystem,windows"}) catch @panic("OOM");
+        // The exe icon: CMake had qimgv.rc in add_executable so MinGW's windres stamped
+        // it; the zig port dropped that step and would ship a generic icon.
+        objects.append(b.allocator, windowsResource(b)) catch @panic("OOM");
+    }
 
     const binary = linkApp(b, cxx, objects.items, link_flags.items, "qimgv", is_windows);
 
@@ -509,6 +514,20 @@ fn qtTool(b: *std.Build, name: []const u8) ?[]const u8 {
         if (std.mem.indexOf(u8, version, " 6.") != null) return path;
     }
     return null;
+}
+
+/// Compiles qimgv.rc (the Windows exe icon) into the COFF object the linker takes.
+/// windres resolves the .ico named inside the .rc relative to its working directory,
+/// so the command runs from qimgv/, where the "res/..." path exists.
+fn windowsResource(b: *std.Build) std.Build.LazyPath {
+    const windres = b.findProgram(.{ .names = &.{ "windres", "llvm-windres" } }) orelse
+        @panic("windres not found: install binutils (mingw-w64-x86_64-binutils)");
+    const run = b.addSystemCommand(&.{ windres, "-O", "coff", "-o" });
+    const out = run.addOutputFileArg("qimgv.rc.o");
+    run.setCwd(b.path("qimgv"));
+    run.addFileArg(b.path("qimgv/qimgv.rc"));
+    run.addFileInput(b.path("qimgv/res/icons/common/logo/app/qimgv.ico"));
+    return out;
 }
 
 fn installBinary(b: *std.Build, binary: std.Build.LazyPath, is_windows: bool, is_macos: bool) *std.Build.Step.InstallFile {
