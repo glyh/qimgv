@@ -28,6 +28,10 @@ pub fn build(b: *std.Build) void {
     const with_video = b.option(bool, "video", "build the mpv video player plugin") orelse true;
     const with_opencv = b.option(bool, "opencv", "HQ scaling through OpenCV") orelse false;
     const with_kde = b.option(bool, "kde", "blur behind the window under KDE") orelse false;
+    // Slice 1: JPEG decode through zig/src/decode.zig (libjpeg-turbo). Off by
+    // default so a plain `zig build` compiles neither the Zig code nor the
+    // header; see docs/zig-interop.md.
+    const with_zig_decode = b.option(bool, "zig-decode", "decode through zig/src/decode.zig") orelse false;
     const translations_path = b.option(
         []const u8,
         "translations-path",
@@ -63,6 +67,7 @@ pub fn build(b: *std.Build) void {
     if (with_exiv2) add(&flags, b.allocator, &.{"-DUSE_EXIV2"}) catch @panic("OOM");
     if (with_opencv) add(&flags, b.allocator, &.{"-DUSE_OPENCV"}) catch @panic("OOM");
     if (with_kde) add(&flags, b.allocator, &.{"-DUSE_KDE_BLUR"}) catch @panic("OOM");
+    if (with_zig_decode) add(&flags, b.allocator, &.{ "-DUSE_ZIG_DECODE", "-Izig/include" }) catch @panic("OOM");
     if (with_video) {
         add(&flags, b.allocator, &.{
             "-DUSE_MPV",
@@ -167,6 +172,8 @@ pub fn build(b: *std.Build) void {
     if (with_exiv2) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"exiv2"})) catch @panic("OOM");
     if (with_opencv) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"opencv4"})) catch @panic("OOM");
     if (with_kde) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"KF6WindowSystem"})) catch @panic("OOM");
+    // The Zig core is a static archive and does not carry its dependencies.
+    if (with_zig_decode) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"libturbojpeg"})) catch @panic("OOM");
     if (is_windows) {
         add(&link_flags, b.allocator, &.{"-mwindows", "-Wl,--subsystem,windows"}) catch @panic("OOM");
         // The exe icon: CMake had qimgv.rc in add_executable so MinGW's windres stamped
@@ -174,7 +181,8 @@ pub fn build(b: *std.Build) void {
         objects.append(b.allocator, windowsResource(b)) catch @panic("OOM");
     }
 
-    const binary = linkApp(b, cxx, objects.items, link_flags.items, "qimgv", is_windows);
+    const zig_core = if (with_zig_decode) zigCore(b, target, optimize) else null;
+    const binary = linkApp(b, cxx, objects.items, link_flags.items, "qimgv", is_windows, zig_core);
 
     b.getInstallStep().dependOn(&installBinary(b, binary, is_windows, is_macos).step);
 
@@ -223,7 +231,7 @@ pub fn build(b: *std.Build) void {
         add(&plugin_link, b.allocator, pkgConfig(b, "--libs", &.{"mpv"})) catch @panic("OOM");
         add(&plugin_link, b.allocator, &.{"-shared"}) catch @panic("OOM");
 
-        const plugin_bin = linkApp(b, cxx, plugin_objects.items, plugin_link.items, "player_mpv", is_windows);
+        const plugin_bin = linkApp(b, cxx, plugin_objects.items, plugin_link.items, "player_mpv", is_windows, null);
         const plugin_name = if (is_windows) "player_mpv.dll" else "player_mpv.so";
         const plugin_install = b.addInstallFileWithDir(
             plugin_bin,
@@ -359,13 +367,50 @@ fn linkApp(
     link_flags: []const []const u8,
     name: []const u8,
     is_windows: bool,
+    zig_core: ?std.Build.LazyPath,
 ) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{cxx});
     for (objects) |obj| run.addFileArg(obj);
+    // The slice's archive goes before the -l flags: it needs libturbojpeg, and
+    // with --as-needed a library listed before its consumer is dropped.
+    if (zig_core) |lib| run.addFileArg(lib);
     run.addArg("-o");
     const out = run.addOutputFileArg(if (is_windows) b.fmt("{s}.exe", .{name}) else name);
     run.addArgs(link_flags);
     return out;
+}
+
+/// One static library for the whole Zig core; a slice is a file root.zig
+/// imports, so this function does not change when slice 2 lands.
+fn zigCore(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+) std.Build.LazyPath {
+    // The TurboJPEG API comes from the installed header via translate-c: zig
+    // 0.17 has no @cImport, and hand-copying an enum whose values come from a
+    // system header is how a decoder ends up asking for the wrong pixel format.
+    const tj_c = b.addTranslateC(.{
+        .root_source_file = b.path("zig/src/tj_include.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tj_c.addSystemIncludePath(.{ .cwd_relative = pkgConfigVar(b, "includedir", "libturbojpeg") });
+
+    const mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        // Not optional: the C++ link is a PIE, and a Zig .a is not PIC by
+        // default (`relocation R_X86_64_32S ... making a PIE object`).
+        .pic = true,
+        // The slice allocates through the C allocator and calls a C library.
+        .link_libc = true,
+    });
+    mod.addImport("tj", tj_c.createModule());
+    mod.linkSystemLibrary("turbojpeg", .{});
+    const lib = b.addLibrary(.{ .linkage = .static, .name = "qimgv_core", .root_module = mod });
+    return lib.getEmittedBin();
 }
 
 /// Transitive quoted includes of `start_rel`, as build-root-relative LazyPaths.

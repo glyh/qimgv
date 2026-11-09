@@ -1,286 +1,309 @@
 # Interop: how a Zig slice plugs into qimgv
 
-Rules for adding a Zig module to this tree, from [Interop and build: how a Zig slice
-plugs into the zig build graph](https://github.com/glyh/iv/issues/10). Slice 1
-(decode) is [Which slice goes first…](https://github.com/glyh/iv/issues/11); this
-document is what slice 2 (scale) should not have to re-derive.
+The rules for adding a Zig module to this tree, decided in [Interop and build: how a
+Zig slice plugs into the zig build graph](https://github.com/glyh/iv/issues/10) and
+proven by the first slice, which is in the tree: JPEG decode through
+`zig/src/decode.zig`, behind `-Dzig-decode` (off by default).
 
-Everything below marked **verified** was run on this machine (zig 0.17.0, Qt 6.12.0,
-clang 20/gcc 16) — the probe commands are named so they can be repeated.
+Everything marked **verified** was run on this machine (zig 0.17.0, Qt 6.12.0,
+TurboJPEG 3.2.1, clang 20/gcc 16). The checks are in the tree where they can be:
+`scripts/zig-decode-check.sh`.
 
 ## The shape
 
 One static library, one hand-written C header, one build option.
 
 ```
-zig/src/root.zig          the whole Zig core; slices are files it imports
-zig/include/qimgv_core.h  the ABI: POD structs, enum codes, qz_* functions
-qimgv/utils/qzimage.*     the C++ adapter (QImage over a qz_buf, RAII)
+zig/src/root.zig          the Zig core; slices are files it imports
+zig/src/decode.zig        slice 1: JPEG decode (libjpeg-turbo via TurboJPEG)
+zig/include/qimgv_core.h  the ABI: POD structs, codes, qimg_* functions
+qimgv/utils/qzimage.*     the C++ adapter (QImage over a qimg_bitmap)
+scripts/zig-decode-check* the pixel-equality check for the decode slice
 ```
 
-A slice is **not** a separate library. It is a set of `export fn`s added to
-`zig/src/root.zig` plus declarations in the one header. That keeps one link line,
-one include path, one place the ABI version lives, and means slice 2 is a new
-`.zig` file and new header declarations — no build changes at all.
+A slice is **not** a separate library. It is `export fn`s added to `zig/src/root.zig`
+plus declarations in the one header — slice 2 adds a file, imports it in `root.zig`,
+and declares its functions; `build.zig` does not change. That keeps one link line, one
+include path, one ABI version.
 
-The library is built **only when a `#ifdef USE_ZIG_*` is on**, so a plain
-`zig build` compiles neither the Zig code nor the header (`zig build` stays
-behaviourally identical to today). This is #11's kill switch and it is the reason
-the option is a flag and not a runtime setting.
+The library is built **only when a `-Dzig-*` flag is on**, so a plain `zig build`
+compiles neither the Zig code nor the header and stays behaviourally identical to a
+tree without the slice. This is the kill switch: revert by rebuilding without the
+flag, no revert commit, no runtime switch rotting in the shipped binary.
 
 ## The build wiring
 
-Four edits to `build.zig`, and nothing else. Verified by applying them to a copy of
-this tree, adding a stub `zig/src/root.zig`, and running
-`zig build -Doptimize=ReleaseFast -Dzig-core=true` (exit 0, `qz_*` symbols in the
-resulting binary), then `zig build -Doptimize=ReleaseFast` (exit 0, no Zig library
-step at all, no `qz_*` symbols).
+The parts that are not obvious, all of them load-bearing. The full code is in
+`build.zig` (`with_zig_decode`, `zigCore`, `linkApp`).
 
 ```zig
-// 1. the option, next to with_exiv2 / with_video / with_opencv
-const with_zig_core = b.option(bool, "zig-core", "build and link the zig core") orelse false;
+// the option, next to with_exiv2 / with_video / with_opencv
+const with_zig_decode = b.option(bool, "zig-decode", "decode through zig/src/decode.zig") orelse false;
 
-// 2. the flags: the C++ side sees the define and the header directory
-if (with_zig_core) add(&flags, b.allocator, &.{ "-DUSE_ZIG_CORE", "-Izig/include" });
+// the C++ side sees the define and the header directory
+if (with_zig_decode) add(&flags, b.allocator, &.{ "-DUSE_ZIG_DECODE", "-Izig/include" });
 
-// 3. the library itself
-fn zigCore(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) std.Build.LazyPath {
-    const lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "qimgv_core",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("zig/src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .pic = true,          // required; see below
-            .link_libc = true,    // required for std.heap.c_allocator / any libc call
-        }),
-    });
-    return lib.getEmittedBin();
-}
+// the library (one per tree, not one per slice)
+const tj_c = b.addTranslateC(.{
+    .root_source_file = b.path("zig/src/tj_include.h"),
+    .target = target,
+    .optimize = optimize,
+});
+tj_c.addSystemIncludePath(.{ .cwd_relative = pkgConfigVar(b, "includedir", "libturbojpeg") });
 
-// 4. the link step: linkApp gains one optional argument, added after the -l flags
-if (zig_lib) |lib| run.addFileArg(lib);
+const mod = b.createModule(.{
+    .root_source_file = b.path("zig/src/root.zig"),
+    .target = target,
+    .optimize = optimize,
+    .pic = true,          // required; see below
+    .link_libc = true,    // required for the C allocator and any libc call
+});
+mod.addImport("tj", tj_c.createModule());
+mod.linkSystemLibrary("turbojpeg", .{});
+const lib = b.addLibrary(.{ .linkage = .static, .name = "qimgv_core", .root_module = mod });
 ```
 
-The library compiles with `zig build-lib -fPIC -Ofast` (from `-Doptimize=ReleaseFast`
-plus `.pic`); the C++ side of the same graph compiles with
-`clang++ -std=c++17 -fPIC -O2 -DNDEBUG -DQT_NO_DEBUG … -DUSE_ZIG_CORE -Izig/include`.
-Two knobs, each language's own spelling of the same level.
+Verified consequences, each one a build failure if you get it wrong:
 
-Things that are load-bearing, each verified:
+- **`.pic = true` is mandatory.** Without it the C++ link dies with `relocation
+  R_X86_64_32S … can not be used when making a PIE object`. Zig static libraries are
+  not PIC by default and the C++ link here is a PIE.
+- **`.link_libc = true` is mandatory** as soon as the slice allocates or calls a C
+  library: `error: dependency on libc must be explicitly specified in the build
+  command`, `C allocator is only available when linking against libc`.
+- **`@cImport` does not exist in zig 0.17.** C headers arrive through
+  `addTranslateC` + `mod.addImport`. The translated module is cached under
+  `zig/src/.zig-cache`.
+- **A static archive does not carry its dependencies.** The executable's link line
+  gains the slice's libraries (`pkg-config --libs libturbojpeg`). Only the
+  `-Dzig-decode` build has `libturbojpeg.so.0` in its NEEDED set.
+- **Order matters: archive before the `-l` flags.** With `--as-needed`, a library
+  listed before the object that needs it is dropped, and the link fails on
+  `qimg_decode`'s references. `linkApp` puts `zig_core` right after the objects.
+- **No new dependencies otherwise.** In both builds the NEEDED set is otherwise
+  identical to a plain build, so the binary still runs on a stock Qt.
+- **A shared object works too**, if a slice is ever linked into `player_mpv`: the
+  same archive links into a `-shared` object with `-Wl,--no-undefined`, and
+  `dlopen` + `ctypes` call into it (verified). Pass exactly one archive.
 
-- **`.pic = true` is mandatory.** Without it: `relocation R_X86_64_32S against
-  '__anon_649' can not be used when making a PIE object`. Zig's static libraries are
-  not PIC by default and the C++ link here is a PIE on every Linux distro that
-  matters.
-- **`.link_libc = true` is mandatory** as soon as the slice mallocs or calls a C
-  library (`libjpeg`, `libpng`). Without it: `error: dependency on libc must be
-  explicitly specified in the build command` / `C allocator is only available when
-  linking against libc`.
-- **The C++ side needs `-Izig/include`; moc does not.** `mocFlags()` copies every
-  `-I`/`-D` into the moc invocation, but moc also tolerates an include it cannot
-  resolve (verified: it produces identical output with and without the flag), so
-  what actually needs the include path is the compile of the moc output — and of
-  every TU that includes the C header. Both go through the one flag list.
-- **`getEmittedBin()` is a real dependency**, not a path guess: the archive is built
-  before the link step runs. Verified: the link line carries
-  `…/.zig-cache/o/<hash>/libqimgv_core.a`.
-- **The archive goes last** on the link line, after the `pkg-config --libs` flags.
-  `-l` flags first, archive after — that is the order the spike used.
-- **No new runtime dependencies.** `ldd` and `readelf -d` on the linked binary show
-  the same NEEDED set as today (Qt6\*, exiv2, libstdc++, libm, libgcc_s, libc). Zig
-  does not pull in libunwind or a thread library, and `player_mpv.so` is untouched.
-  So the shipped binary still runs on a stock Qt.
-- **A shared object works too**, if a slice is ever linked into `player_mpv` rather
-  than the executable: linking the same archive into a `-shared` object with
-  `-Wl,--no-undefined` succeeds and `dlopen` + `ctypes` calls into it work
-  (verified). Pass exactly one archive; passing several stale copies of the same
-  archive is how you get `undefined symbol: __zig_probe_stack`.
-
-`build.zig`'s `scanSources` walks the tree, so `zig/` needs no entry in it: nothing
-under `zig/src` is `.cpp`/`.ui`/`Q_OBJECT`, and `zig/include` is not a source root.
+`scanSources` walks the tree, so `zig/` needs no entry there: nothing under
+`zig/src` is a `.cpp`/`.ui`, and no header there contains `Q_OBJECT`.
 
 ## The header
 
-`zig/include/qimgv_core.h` is written by hand, in C, and is included by C++ (and by
-moc, which parses it). Verified pass with moc 6.12 behind a `Q_OBJECT` header:
-`extern "C"` blocks, `#ifndef`/`#pragma once` guards, `#include <stdint.h>`,
-`#include <stdbool.h>` + `bool` fields, anonymous unions/structs,
-`__attribute__((aligned(16)))`, `_Static_assert`, `#define`/`#if` blocks,
-function-pointer typedefs and fields, struct fields named `signals`/`slots`/`emit`,
-unscoped `enum` in a signal signature, and `uint8_t*`/`void*` members. The generated
-`moc_*.cpp` compiles, links against Qt6Widgets and runs.
+`zig/include/qimgv_core.h` is hand-written C, included by C++ and parsed by moc.
+
+moc 6.12 accepts everything it needs to (verified construct by construct): `extern
+"C"` blocks, include guards, `<stdint.h>`/`<stdbool.h>`, `bool` fields, anonymous
+unions, `__attribute__((aligned(16)))`, `_Static_assert`, `#define`/`#if`,
+function-pointer fields, fields named `signals`/`slots`/`emit`, and unscoped enums in
+signal signatures. The generated `moc_*.cpp` compiles, links and runs.
 
 Two traps:
 
-- **`_Bool` passes moc but fails the C++ compiler.** moc's parser is lenient; clang++
-  rejects `_Bool` in a `.cpp`. Use `uint8_t` (or `bool` from `<stdbool.h>`) in any
-  struct a `.cpp` sees.
-- **A file whose text merely contains `Q_OBJECT` is moc'd anyway**, because
-  `scanSources` recognises moc inputs by substring search. That is harmless: moc
-  exits 0 and writes a **zero-byte** `moc_*.cpp`, which compiles to nothing
-  (verified). Do not rely on it for anything, but do not "fix" it either.
+- **`_Bool` passes moc and fails clang++.** moc's parser is lenient; the C++ compiler
+  is not. Use `uint8_t` in anything a `.cpp` sees.
+- **A file whose text merely contains `Q_OBJECT` is moc'd anyway** (`scanSources`
+  recognises moc inputs by substring). Harmless: moc writes a zero-byte `moc_*.cpp`
+  and exits 0.
 
-Never in this header: C++ types (`std::`, `QString`, templates, references),
-`inline` functions, or anything moc would have to understand beyond POD. Zig types
-never appear either — the header is the single source of truth for layout, and the
-Zig side mirrors it with `extern struct` (below).
+Never in this header: C++ types (`std::`, `QString`, templates, references), `inline`
+functions, or any Zig type. The header is the single source of truth for layout; the
+Zig side mirrors it with `extern struct`.
 
 ## Ownership
 
 **Zig allocates, C++ wraps.** One allocation per bitmap, zero copies, one free path.
 
 ```zig
-const Buf = extern struct {   // byte-for-byte the C qz_buf
-    ptr: ?[*]u8, len: usize,
-    stride: u32, width: u32, height: u32, format: u32,
+pub const Bitmap = extern struct {   // byte-for-byte qimg_bitmap
+    data: ?[*]u8, w: u32, h: u32, stride: u32, fmt: c_int, bytes: u32,
 };
 ```
 
 ```cpp
-// the adapter, qimgv/utils/qzimage.cpp: the only place that knows both sides
-static void qz_cleanup(void *info) {
-    auto *b = static_cast<qz_buf *>(info);
-    qz_buffer_free(b->ptr, b->len);   // zig frees
-    delete b;                          // the descriptor only
+// qimgv/utils/qzimage.cpp — the only file that knows both sides
+std::unique_ptr<QImage> QzImage::takeImage(qimg_bitmap &bmp) {
+    BitmapOwner owner(bmp);                       // frees on any early return
+    bmp = qimg_bitmap{};
+    qimg_bitmap *raw = owner.release();
+    return std::unique_ptr<QImage>(new QImage(
+        raw->data, raw->w, raw->h, raw->stride, fmt, freeBitmap, raw));
 }
-QImage image(qz_buf.ptr, qz_buf.width, qz_buf.height, qz_buf.stride,
-             QImage::Format_RGBA8888, qz_cleanup, owned_copy_of_descriptor);
 ```
 
 Verified: Qt 6.12 has the `QImageCleanupFunction` constructor
-(`qimage.h:89-92`), so the QImage's destructor is the free. `QImage` may be copied
-freely — the cleanup runs once, on the last copy.
+(`qimage.h:89-92`), so **the QImage's destructor is the free**, and Qt calls it once,
+on the last copy. Rules that follow:
 
-Rules that follow:
+- Every path that receives a `qimg_bitmap` either wraps it or calls
+  `qimg_bitmap_free`; a failed call leaves `out` zeroed and owns nothing.
+- `qimg_bitmap.bytes` is `stride * h` — the caller never recomputes a size.
+- Internal scratch memory is freed inside the call. Only pixels cross.
+- **Do not shallow-copy a QImage and then free the buffer.** `convertToFormat` to the
+  same format is a shallow copy; the in-tree checker hits this trap deliberately
+  (`zig.copy()`), and anything else that reads pixels after the wrap must do the
+  same.
 
-- The caller **must** hand the buffer to something that takes ownership (QImage with
-  cleanup, or `qz_buffer_free`) on every path, including error paths.
-- Partial output on error: a function that returns non-`QZ_OK` must leave `out`
-  zeroed and own nothing. C++ never frees a buffer from a failed call.
-- No `std.heap.page_allocator`-sized surprises: the size of a returned bitmap is
-  `len`/`stride`/`width`/`height` in the struct, not something the caller derives
-  from the file header.
-- Internal scratch memory belongs to the Zig side and is freed inside the call. Nothing
-  but a `qz_buf` crosses the boundary.
-
-Layout is fixed by the header, not by the Zig compiler: the same `extern struct`
-prints `size=32 ptr=0 len=8 stride=16 w=20 h=24 fmt=28` in `Debug` and in
-`ReleaseFast` and matches the C `sizeof`/`offsetof` (verified). So the optimisation
-level can never make the two sides disagree.
+Layout cannot disagree with the C++ side: an `extern struct` prints the same
+`size`/`offset`s in `Debug` and `ReleaseFast` and matches C's `sizeof`/`offsetof`
+(verified), so the optimisation level is not part of the ABI.
 
 ## Errors
 
-Codes cross, messages do not. One enum for the whole core, with a numeric range per
+Codes cross, messages do not. One enum for the whole core, one numeric range per
 slice so codes never collide:
 
 ```c
-typedef enum qz_status {
-    QZ_OK = 0,
-    QZ_ERR_INVALID_ARG = 1, QZ_ERR_NO_MEMORY = 2, QZ_ERR_IO = 3,
-    QZ_ERR_DECODE = 10, QZ_ERR_UNSUPPORTED = 11, QZ_ERR_TOO_LARGE = 12,  /* decode  */
-    QZ_ERR_SCALE = 100,                                                    /* scale */
-} qz_status;
-int qz_status_detail(char *dst, size_t cap);  /* thread-local, best effort */
+typedef enum qimg_status {
+    QIMG_OK = 0,
+    QIMG_E_INVALID_ARG = -1, QIMG_E_NO_MEMORY = -2, QIMG_E_IO = -3,
+    QIMG_E_UNSUPPORTED = -10, QIMG_E_FORMAT = -11,   /* decode slice: -10 .. -19 */
+} qimg_status;
+int32_t qimg_status_detail(char *dst, int32_t cap);  /* thread-local, best effort */
 ```
 
-- Detail is per-thread (`threadlocal` in Zig), so concurrent pool workers do not
-  overwrite each other. It is for logs, never for control flow.
-- **No panic may be reachable from any `export fn`.** Verified: a `@panic`, an
-  `unreachable`, or a Debug/ReleaseSafe integer overflow aborts the process —
-  `SIGABRT`, exit 134, uncatchable, in **every** optimize mode. There is no "safety
-  net" mode; argument validation and explicit error returns are the whole
-  strategy. In `ReleaseFast` an overflow instead wraps silently, so arithmetic on
-  file-supplied sizes is checked explicitly (`std.math.mul/add`), not trusted to
-  safety checks.
-- **Nothing throws across the boundary, in either direction.** Directions matter:
-  C++ → Zig carries no exceptions (Zig never throws). Zig → C++ is where the hazard
-  lives (#7: libqt6zig has no exception barrier and 0 `try`/`catch`), so **the Zig
-  side never calls Qt, and never calls C++ that can throw** — only libc and C
-  libraries. The adapter does the Qt work on the C++ side.
-- A Zig panic in a release build is still `abort()`; treat every `unreachable`,
-  `@panic`, `.?`, `unused`, bounds violation and checked-cast failure in slice code
-  as a crash of the user's viewer.
+- Detail is `threadlocal` in Zig, so concurrent pool workers don't clobber each
+  other. Logs only, never control flow.
+- **No panic may be reachable from an `export fn`.** Verified: `@panic`,
+  `unreachable` and a Debug/ReleaseSafe integer overflow all abort the process —
+  SIGABRT, exit 134, uncatchable, in **every** optimize mode. In ReleaseFast an
+  overflow instead wraps silently. So argument validation and explicit codes are the
+  whole strategy, and arithmetic on file-supplied sizes is done in wide types
+  (`i64` for `w * num / denom`, never `u32 * f32`-ish shortcuts).
+- **Compute-then-store, never store-then-fail.** A function zeroes `out` on entry,
+  allocates into locals, and assigns `out.*` only on success; the one failure that
+  happens after an allocation frees it first (this is why `decode.zig` has
+  `gpa.free(dst)` in the error arm rather than an `errdefer`: a `c_int` return has no
+  error union to defer).
+- **Nothing throws, either direction.** C++ → Zig carries no exceptions. Zig → C++ is
+  where the hazard lives (#7: no exception barrier, 0 `try`/`catch` in libqt6zig), so
+  the Zig side never calls Qt and never calls C++ that can throw — only libc and C
+  libraries. TurboJPEG specifically, rather than raw libjpeg: libjpeg's error path is
+  `error_exit`, which calls `exit()` or longjmps, and there is no `setjmp` across a
+  Zig frame. TurboJPEG returns a code.
 
 ## Threading
 
-**Qt owns the threads; the Zig core is synchronous and owns none.** This mirrors what
-upstream does (libqt6zig binds `QThreadPool`, `QRunnable`, `QThread`, `QEventLoop`,
-`QMutex`: Zig calls Qt's primitives), and it is the reason `std.Io` is **not** in
-this ABI.
+**Qt owns the threads; the Zig core is synchronous and owns none.**
 
-- A slice function runs on whatever thread calls it — normally a
-  `Loader`/`Scaler`/`Thumbnailer` `QRunnable::run()`. It must be safe to call from
-  several of those at once: no global mutable state, no lazy globals, no shared
-  handles. A `threadlocal` detail string is fine.
-- The pools are Qt's: `Loader` (2 threads), `Scaler`, `Thumbnailer`
-  (`thumbnailerThreadCount`), each with its own `QThreadPool`. The slice never
-  spawns threads and never starts a thread pool of its own, so there is nothing to
-  join at shutdown and nothing to oversubscribe.
-- If slice code needs mutual exclusion internally, use `std.Thread.Mutex` inside the
-  call. It is invisible across the ABI and does not call Qt.
-- **Lifecycle.** Any process-wide Zig state is initialised from `main()` before
-  images load and released after `Thumbnailer::~Thumbnailer()`'s
-  `pool->waitForDone()`. Nothing on the public ABI takes a destructor order between
-  Zig and Qt today, because slice state is per-call.
-- **Cancellation is the caller's.** Today: when a folder changes, results for the
-  old folder are dropped on arrival (filter by path), which is #11's scope. #37
-  adds a generation token to the ABI; because a slice is a plain synchronous
-  function, that arrives as one more parameter, not a redesign.
-
-Why not `std.Io`: it is a real interface and it would work (an `Io` instance's
-`async`/`concurrent` are documented thread-safe, and one `Threaded` instance served
-6 foreign threads doing `readFile` in a probe), but it introduces a second
-concurrency substrate — its own detached worker threads, `async_limit` defaults to
-CPU-1, `concurrent_limit` unlimited — inside a process whose threads and
-cancellation already belong to Qt. Two owners of "how work runs" is exactly the
-kind of thing that produces shutdown races in a viewer. Adopting it later is a
-slice-level change (it is not in this ABI now).
+- A slice runs on whatever thread calls it — normally a `Loader`/`Scaler`/
+  `Thumbnailer` `QRunnable::run()`. It must be safe to call from several at once: no
+  global mutable state, no lazy globals. A `threadlocal` detail buffer is fine.
+- The pools are Qt's: `Loader` (2 threads), `Scaler`, `Thumbnailer`, each with its own
+  `QThreadPool`. The slice never spawns threads, so there is nothing to join at
+  shutdown and nothing to oversubscribe.
+- If slice code needs mutual exclusion internally, `std.Thread.Mutex` — invisible
+  across the ABI, and it does not call Qt.
+- **Lifecycle.** Process-wide Zig state (there is none yet) would be set up from
+  `main()` before images load and released after `Thumbnailer::~Thumbnailer()`'s
+  `pool->waitForDone()`.
+- **Cancellation is the caller's.** Today: results for a folder that changed are
+  dropped on arrival (filter by path). #37's generation token arrives as one more
+  parameter to a synchronous function — additive, not a redesign.
+- **`std.Io` is deliberately not in this ABI.** It would work (an `Io` instance's
+  `async`/`concurrent` are documented thread-safe, and one `Threaded` instance served
+  6 foreign threads doing `readFile` in a probe), but it brings a second concurrency
+  substrate — detached worker threads, `async_limit` defaulting to CPU−1,
+  `concurrent_limit` unlimited — into a process whose threads and cancellation
+  already belong to Qt. Two owners of "how work runs" is how shutdown races happen.
+  Slice 1 reads files through libc stdio for the same reason: in zig 0.17 every
+  `std.fs` entry point takes a `std.Io`.
 
 ## Optimisation
 
-**One knob, `-Doptimize`, governs both languages.** No `-Dzig-optimize`.
+**One knob, `-Doptimize`, governs both languages.**
 
-- C++ gets `optimizeFlags(optimize)` (`-O0 -g` / `-O2 …` / `-Os …` plus
-  `QT_NO_DEBUG`), the Zig module gets the same `std.builtin.Optimize`.
-- Layout is unaffected: see the `extern struct` check above. A Debug app and a
-  ReleaseFast app read the same bytes, and the boundary exists only as `qz_buf`.
-- `zig build` with no flags is a **Debug** build, which is a trapping binary on
-  purpose (a Zig bug is a crash, not silent corruption). Packagers pass
-  `-Doptimize=ReleaseFast` — `qimgv/distrib/PKGBUILD`, `scripts/build-qimgv.sh` and
-  all three CI workflows already do.
-- A slice's own performance work is measured with the harness in `scripts/bench`
-  against the same `-Doptimize=ReleaseFast` binary that ships (#6, #8).
+- C++ gets `optimizeFlags(optimize)`; the Zig module gets the same
+  `std.builtin.Optimize` (`zig build-lib -fPIC -Ofast` vs `clang++ -fPIC -O2 …`).
+- Layout is unaffected (see the `extern struct` check above).
+- `zig build` with no flags is a **Debug** build, i.e. a trapping binary on purpose:
+  a Zig-side bug becomes a crash, not silent corruption. Every packager passes
+  `ReleaseFast`: `qimgv/distrib/PKGBUILD`, `scripts/build-qimgv.sh`, and all three
+  CI workflows.
+- A slice's performance work is measured with `scripts/bench` against the same
+  `ReleaseFast` binary that ships (#6, #8).
 
 ## Packaging and CI
 
-- **Arch**: `zig` is already in `makedepends`; nothing moves. `PKGBUILD` needs no
-  new flag beyond the `-Dzig-core`-style one that enables the slice, and the
-  installed tree does not change (the archive is statically linked in).
-- **Stock Qt**: the binary's NEEDED set is unchanged (verified), so no new
-  `depends`, no bundled runtime.
-- **Windows/macOS**: not verified on this machine. MinGW's `ld` reading a Zig
-  archive is the open question — the CI gate is
-  `zig build -Doptimize=ReleaseFast -D<slice>=true` on all three workflows
-  (`.github/workflows/{linux,windows,macos}.yml`), added in the same change that
-  lands a slice.
-- **Both builds in CI.** The plain build must stay green (the kill switch is
-  build-time), and so must the slice build. `scripts/bench/bench.py` gains a flag to
-  pick which binary produced a row, because the A/B is now across binaries.
+- **Arch**: `zig` is already in `makedepends`; the slice adds `libturbojpeg` (an
+  optdepends-style build knob in `PKGBUILD` terms, a normal dependency of the
+  `-Dzig-decode=true` build). Nothing in the install tree changes: the archive is
+  linked in statically, and only the slice's own `libturbojpeg` shows up as NEEDED.
+- **Stock Qt**: no new Qt dependency in either build.
+- **Windows/macOS**: the wiring is platform-neutral, but MinGW's `ld` reading a Zig
+  archive and the TurboJPEG package name under MSYS2 are unverified here. The gate is
+  `zig build -Doptimize=ReleaseFast` and `… -Dzig-decode=true` in all three workflows
+  (`.github/workflows/{linux,windows,macos}.yml`).
+- **Both builds in CI**, because the kill switch is build-time: the plain build must
+  stay green, and so must the slice build.
+
+## Slice 1: what actually landed
+
+`-Dzig-decode` swaps the decode inside `ImageStatic::loadGeneric()`
+(`qimgv/sourcecontainers/imagestatic.cpp`):
+
+```cpp
+void ImageStatic::loadGeneric() {
+#ifdef USE_ZIG_DECODE
+    if(loadViaZig())
+        return;                 // QImage wrapped over the Zig bitmap
+#endif
+    …today's QImageReader path, unmodified…
+}
+```
+
+- **Every failure falls back to Qt.** `QIMG_E_UNSUPPORTED` (not a JPEG — PNG, WebP,
+  ICO, RAW…), `QIMG_E_FORMAT` (truncated or malformed), `QIMG_E_IO`, a format the
+  adapter does not know: all of them continue into the `QImageReader` path that ships
+  today. A viewer must open at least as many files after the change as before, and
+  Qt's JPEG reader is the more forgiving of the two.
+- **Full size only.** `qimg_decode` is called with `max_w = max_h = 0`. The
+  display-size contract is #38's; the ABI already takes the numbers, and
+  `decode.zig` implements TurboJPEG's scaling for a later caller, but nothing passes
+  a bound yet.
+- **EXIF rotation stays where it was** — `ImageLib::exifRotated(...,
+  mDocInfo->exifOrientation())`, applied to the decoded bitmap exactly as before. The
+  `qimg_meta` in #11's sketch (orientation returned by the decoder, so
+  `documentinfo.cpp`'s second `QImageReader` pass can be cancelled) is **not** part of
+  this landing: that pass is a separate, measurable change, and duplicating exiv2's
+  EXIF read in Zig would add surface without removing the pass.
+
+Measured with `scripts/zig-decode-check.sh`, which decodes every file twice — Qt and
+the slice — and compares after format normalisation:
+
+| input | result |
+|---|---|
+| COCO val2017, all 4 952 JPEGs | **identical**, 0 mismatches |
+| W3 8736×11648 (101.8 MP, progressive) | identical |
+| COCO subset re-encoded progressive | identical |
+| COCO subset converted to grayscale | identical |
+| CLIC PNGs | falls back (`header: Not a JPEG file: starts with 0x89 0x50`) |
+| truncated JPEG | falls back (`decode: Premature end of JPEG file`); Qt decodes it |
+| junk bytes, no image | Qt fails as well |
+
+So the slice is a **substitution, not a perf claim** — which is what #11 graded it on.
+The kill-switch side is verified too: `zig build -Doptimize=ReleaseFast` (no flag)
+links no `qimg_*` symbols, has no `libturbojpeg` NEEDED entry, and builds the byte
+count it did before.
 
 ## Adding slice 2 (the checklist)
 
-1. Add `zig/src/scale.zig`; `pub const scale = @import("scale.zig");` in `root.zig`.
+1. Add `zig/src/scale.zig`; `pub const scale = @import("scale.zig");` in `root.zig`,
+   and `_ = scale;` in the existing `comptime` block.
 2. Declare its functions and any new POD struct in `zig/include/qimgv_core.h`; bump
-   `QZ_ABI_VERSION` only if an existing struct or signature changes.
-3. Give it an error range (`QZ_ERR_SCALE = 100`).
-4. Write the C++ adapter in `qimgv/utils/qzimage.*` (wrap the `qz_buf`, own the free).
+   `QIMGV_ABI_VERSION` only if an existing struct or signature changes.
+3. Give it a code range (`QIMG_E_SCALE = -100` and down).
+4. Wrap its output in the adapter (`qimgv/utils/qzimage.*`) — a `qimg_bitmap` always
+   becomes a `QImage` with `freeBitmap`, never a bare pointer.
 5. Put the call behind `#ifdef USE_ZIG_<SLICE>` at the existing seam, with today's
-   code as the `#else`.
-6. Add `-Dzig-<slice>` to `build.zig`'s flag list (the library and link step are
-   already wired).
-7. Add the flag to the three CI workflows and to the bench runner.
-8. Delete the `#else` and retire the option once the slice is graded, or delete the
-   Zig file and the `#ifdef` if it lost. A switch that outlives its grading round is
-   a bug.
+   code as the `#else`, and fall back to it on every error code.
+6. Add the `-Dzig-<slice>` option and its `-DUSE_ZIG_<SLICE>`/`-Izig/include` pair to
+   the flag list, and its libraries to `link_flags`. The library and link step are
+   already wired.
+7. Add the flag to the three CI workflows.
+8. Extend the equality check (`scripts/zig-decode-check.cpp` is the pattern: same
+   input twice, compare after normalisation) and run it on the pinned corpus.
+9. Delete the `#else` and retire the option once the slice is graded, or delete the
+   Zig file and the `#ifdef` if it lost. A switch that outlives its grading round is a
+   bug.
