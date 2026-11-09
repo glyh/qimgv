@@ -193,7 +193,11 @@ void DocumentInfo::loadExifTags() {
     try {
         std::unique_ptr<Exiv2::Image> image;
 
-        image = Exiv2::ImageFactory::open(toStdString(fileInfo.filePath()));
+        // exiv2 0.28 removed its std::wstring overloads. On Windows it expects the path
+        // as UTF-8 -- its UCRT64 builds rely on UCRT's UTF-8 support -- which is what
+        // QString::toStdString() produces, so this deliberately does not go through the
+        // project's wide StdString helper.
+        image = Exiv2::ImageFactory::open(fileInfo.filePath().toStdString());
 
         assert(image.get() != 0);
         image->readMetadata();
