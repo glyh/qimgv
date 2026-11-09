@@ -41,7 +41,7 @@ Pins (HEAD sha, tip date):
 | lektra | 345 | `QGraphicsView` + optional `QOpenGLWidget` viewport | `src/GraphicsView.cpp:1365` |
 | PhotoQt | 96 (mirror) | Qt Quick scene graph (no custom RHI node found in the mirror) | `cplusplus/`, QML under `qml/` |
 
-**Eight of nine paint through the same `QGraphicsScene` this fork uses.** The renderer frontier is one project, and it is a qimgv fork.
+**Seven of the nine paint through the same `QGraphicsScene` this fork uses.** The two that do not are PhotoQt (Qt Quick, no custom RHI node found in the mirror) and Wynpix (QRhi) — so the renderer frontier in the family is one project, and it is a fork of this one.
 
 ## Wynpix: what it actually changed
 
