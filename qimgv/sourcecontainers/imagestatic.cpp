@@ -1,5 +1,10 @@
 #include "imagestatic.h"
 #include <time.h>
+#ifdef USE_ZIG_DECODE
+#include <QDebug>
+#include "qimgv_core.h"
+#include "utils/qzimage.h"
+#endif
 
 ImageStatic::ImageStatic(QString _path)
     : Image(_path)
@@ -29,6 +34,13 @@ void ImageStatic::load() {
 
 
 void ImageStatic::loadGeneric() {
+#ifdef USE_ZIG_DECODE
+    if(loadViaZig())
+        return;
+    // Fall through: not a JPEG, or the slice could not read it. Qt keeps every
+    // other format and stays the fallback, so nothing that opened before stops
+    // opening.
+#endif
     /* QImageReader::read() seems more reliable than just reading via QImage.
      * For example: "Invalid JPEG file structure: two SOF markers"
      * QImageReader::read() returns false, but still reads an image. Meanwhile QImage just fails.
@@ -57,6 +69,34 @@ void ImageStatic::loadGeneric() {
     }
     mLoaded = true;
 }
+
+#ifdef USE_ZIG_DECODE
+bool ImageStatic::loadViaZig() {
+    qimg_bitmap bmp = qimg_bitmap{};
+    // Full size, always: the display-size contract (#38) is a later slice, and
+    // this landing must be a substitution, not a behaviour change.
+    const QByteArray nativePath = mPath.toUtf8();
+    const int32_t rc = qimg_decode(nativePath.constData(), 0, 0, &bmp);
+    if(rc != QIMG_OK) {
+        if(rc != QIMG_E_UNSUPPORTED) {
+            char detail[192] = {0};
+            qimg_status_detail(detail, sizeof(detail));
+            qDebug() << "ImageStatic: zig decode failed" << mPath << rc << detail;
+        }
+        return false;
+    }
+    std::unique_ptr<QImage> decoded = QzImage::takeImage(bmp);
+    if(!decoded) {
+        QzImage::release(bmp);
+        return false;
+    }
+    std::unique_ptr<const QImage> img(decoded.release());
+    img = ImageLib::exifRotated(std::move(img), mDocInfo.get()->exifOrientation());
+    image = std::move(img);
+    mLoaded = true;
+    return true;
+}
+#endif
 
 // TODO: move this out somewhere to use in other places
 void ImageStatic::loadICO() {
