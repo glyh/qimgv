@@ -1,0 +1,37 @@
+name: macos
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macos-latest / Homebrew Qt
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Homebrew's qt, not aqtinstall: the Qt packages aqtinstall serves for macOS carry
+      # no lib/pkgconfig/*.pc, and build.zig discovers Qt through pkg-config.
+      - name: Install Qt, exiv2 and mpv
+        run: brew install qt exiv2 mpv pkg-config
+
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+
+      - name: Build
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix qt)/lib/pkgconfig:$(brew --prefix exiv2)/lib/pkgconfig:$(brew --prefix mpv)/lib/pkgconfig"
+          zig build -Doptimize=ReleaseFast
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qimgv-macos
+          path: zig-out/qimgv.app
