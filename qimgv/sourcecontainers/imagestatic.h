@@ -36,5 +36,10 @@ private:
     std::shared_ptr<const QImage> image, imageEdited;
     void loadGeneric();
     void loadICO();
+#ifdef USE_ZIG_DECODE
+    // Returns false when the Zig slice cannot handle this file, so loadGeneric
+    // falls back to today's QImageReader path.
+    bool loadViaZig();
+#endif
     QString generateHash(QString str);
 };
