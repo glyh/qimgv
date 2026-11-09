@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     // (QFile::copy takes std::optional<Permissions>), so libc++-mangled symbols never
     // resolve at link time. C++ therefore compiles with the system compiler; zig owns
     // the graph, the moc/uic/rcc steps, caching and the install tree.
-    const cxx = systemCxx(b) orelse @panic("no C++ compiler found: install clang or gcc");
+    const cxx = systemCxx(b, is_windows) orelse @panic("no C++ compiler found: install clang or gcc");
 
     var flags: std.ArrayList([]const u8) = .empty;
     const add = std.ArrayList([]const u8).appendSlice;
@@ -167,7 +167,12 @@ pub fn build(b: *std.Build) void {
     if (with_exiv2) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"exiv2"})) catch @panic("OOM");
     if (with_opencv) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"opencv4"})) catch @panic("OOM");
     if (with_kde) add(&link_flags, b.allocator, pkgConfig(b, "--libs", &.{"KF6WindowSystem"})) catch @panic("OOM");
-    if (is_windows) add(&link_flags, b.allocator, &.{"-mwindows", "-Wl,--subsystem,windows"}) catch @panic("OOM");
+    if (is_windows) {
+        add(&link_flags, b.allocator, &.{"-mwindows", "-Wl,--subsystem,windows"}) catch @panic("OOM");
+        // The exe icon: CMake had qimgv.rc in add_executable so MinGW's windres stamped
+        // it; the zig port dropped that step and would ship a generic icon.
+        objects.append(b.allocator, windowsResource(b)) catch @panic("OOM");
+    }
 
     const binary = linkApp(b, cxx, objects.items, link_flags.items, "qimgv", is_windows);
 
@@ -265,32 +270,45 @@ fn scanSources(
     while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
 
+        // The walker joins components with the native separator, so on Windows
+        // entry.path is a backslash-separated path. Every test below -- the skip
+        // component list, the "watchers/linux/" match, dead_sources, and the object
+        // names tuName derives from rel -- is written with '/'. Normalise once here;
+        // the raw entry.path is still what the filesystem calls below use.
+        const path = blk: {
+            const normalised = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
+            for (normalised) |*c| {
+                if (c.* == '\\') c.* = '/';
+            }
+            break :blk normalised;
+        };
+
         var skipped = false;
-        var parts = std.mem.tokenizeScalar(u8, entry.path, '/');
+        var parts = std.mem.tokenizeScalar(u8, path, '/');
         while (parts.next()) |part| {
             for (skip) |s| if (std.mem.eql(u8, part, s)) {
                 skipped = true;
             };
         }
-        if (!is_windows and std.mem.indexOf(u8, entry.path, "watchers/windows/") != null) skipped = true;
+        if (!is_windows and std.mem.indexOf(u8, path, "watchers/windows/") != null) skipped = true;
         // The Linux watcher is inotify-only (sys/inotify.h). CMake compiled no watcher at
         // all on Apple -- its APPLE branch is commented out and directorywatcher.cpp falls
         // back to DummyWatcher -- so macOS must not pick this one up.
-        if ((is_windows or is_macos) and std.mem.indexOf(u8, entry.path, "watchers/linux/") != null) skipped = true;
-        for (dead_sources) |dead| if (std.mem.eql(u8, entry.path, dead)) {
+        if ((is_windows or is_macos) and std.mem.indexOf(u8, path, "watchers/linux/") != null) skipped = true;
+        for (dead_sources) |dead| if (std.mem.eql(u8, path, dead)) {
             skipped = true;
         };
         if (skipped) continue;
 
-        const rel = b.fmt("{s}/{s}", .{ root, entry.path });
-        if (std.mem.endsWith(u8, entry.path, ".cpp")) {
+        const rel = b.fmt("{s}/{s}", .{ root, path });
+        if (std.mem.endsWith(u8, path, ".cpp")) {
             cpp.append(b.allocator, b.dupe(rel)) catch @panic("OOM");
-        } else if (std.mem.endsWith(u8, entry.path, ".ui")) {
+        } else if (std.mem.endsWith(u8, path, ".ui")) {
             ui.append(b.allocator, b.dupe(rel)) catch @panic("OOM");
         }
-        if (!std.mem.endsWith(u8, entry.path, ".h") and
-            !std.mem.endsWith(u8, entry.path, ".hpp") and
-            !std.mem.endsWith(u8, entry.path, ".cpp")) continue;
+        if (!std.mem.endsWith(u8, path, ".h") and
+            !std.mem.endsWith(u8, path, ".hpp") and
+            !std.mem.endsWith(u8, path, ".cpp")) continue;
 
         const text = dir.readFileAlloc(io, entry.path, b.allocator, .limited(4 << 20)) catch continue;
         if (std.mem.indexOf(u8, text, "Q_OBJECT") != null or std.mem.indexOf(u8, text, "Q_GADGET") != null) {
@@ -399,7 +417,9 @@ fn resolveInclude(b: *std.Build, from_rel: []const u8, name: []const u8) ?[]cons
 /// Cache/staging name for a moc output: `gui/mainwindow.h` -> `gui_mainwindow`.
 fn tuName(b: *std.Build, rel: []const u8) []const u8 {
     const base = if (std.mem.endsWith(u8, rel, ".cpp")) rel[0 .. rel.len - 4] else std.fs.path.stem(rel);
-    return std.mem.replaceOwned(u8, b.allocator, base, "/", "_") catch @panic("OOM");
+    const slashed = std.mem.replaceOwned(u8, b.allocator, base, "/", "_") catch @panic("OOM");
+    // A surviving separator would become a subdirectory of the cache entry.
+    return std.mem.replaceOwned(u8, b.allocator, slashed, "\\", "_") catch @panic("OOM");
 }
 
 /// moc needs the include and define flags of the TU it serves, nothing else.
@@ -426,9 +446,16 @@ fn optimizeFlags(optimize: std.builtin.Optimize) []const []const u8 {
     };
 }
 
-fn systemCxx(b: *std.Build) ?[]const u8 {
-    if (b.findProgram(.{ .names = &.{"clang++"} })) |path| return path;
-    if (b.findProgram(.{ .names = &.{"g++"} })) |path| return path;
+/// On Windows prefer MinGW's g++: the runner images carry an LLVM clang++ on PATH
+/// that targets x86_64-pc-windows-msvc and rejects flags this build passes it.
+fn systemCxx(b: *std.Build, prefer_gcc: bool) ?[]const u8 {
+    const order = if (prefer_gcc)
+        [_][]const u8{ "g++", "clang++" }
+    else
+        [_][]const u8{ "clang++", "g++" };
+    for (order) |name| {
+        if (b.findProgram(.{ .names = &.{name} })) |path| return path;
+    }
     return null;
 }
 
@@ -454,22 +481,53 @@ fn pkgConfigVar(b: *std.Build, variable: []const u8, module: []const u8) []const
 fn qtTool(b: *std.Build, name: []const u8) ?[]const u8 {
     const io = b.graph.io;
     const prefix = pkgConfigVar(b, "prefix", "Qt6Core");
-    const dirs = [_][]const u8{
+    var dirs: std.ArrayList([]const u8) = .empty;
+    // Qt only defines host_bins for cross builds, but when it is there it is the
+    // authoritative answer.
+    const host_bins = pkgConfigVar(b, "host_bins", "Qt6Core");
+    if (host_bins.len != 0) dirs.append(b.allocator, host_bins) catch @panic("OOM");
+    // bindir/libexecdir are what Homebrew and Debian point at the tools.
+    const bindir = pkgConfigVar(b, "bindir", "Qt6Core");
+    if (bindir.len != 0) dirs.append(b.allocator, bindir) catch @panic("OOM");
+    const libexecdir = pkgConfigVar(b, "libexecdir", "Qt6Core");
+    if (libexecdir.len != 0) dirs.append(b.allocator, libexecdir) catch @panic("OOM");
+    dirs.appendSlice(b.allocator, &.{
         b.fmt("{s}/lib/qt6", .{prefix}),
         b.fmt("{s}/lib/qt6/bin", .{prefix}),
         b.fmt("{s}/lib/qt6/libexec", .{prefix}),
+        // MSYS2 keeps moc/uic/rcc in share/qt6/bin rather than bin/.
+        b.fmt("{s}/share/qt6/bin", .{prefix}),
         b.fmt("{s}/libexec", .{prefix}),
         b.fmt("{s}/bin", .{prefix}),
-    };
-    for (dirs) |dir| {
-        const candidate = b.fmt("{s}/{s}", .{ dir, name });
-        if (std.Io.Dir.cwd().access(io, candidate, .{})) |_| return candidate else |_| {}
+    }) catch @panic("OOM");
+    // Windows tools are moc.exe/uic.exe/...; without the extensioned name every
+    // prefix lookup misses and only the PATH fallback below can save it.
+    const names = [_][]const u8{ name, b.fmt("{s}.exe", .{name}) };
+    for (dirs.items) |dir| {
+        for (names) |candidate_name| {
+            const candidate = b.fmt("{s}/{s}", .{ dir, candidate_name });
+            if (std.Io.Dir.cwd().access(io, candidate, .{})) |_| return candidate else |_| {}
+        }
     }
-    if (b.findProgram(.{ .names = &.{name} })) |path| {
+    if (b.findProgram(.{ .names = &names })) |path| {
         const version = b.run(&.{ path, "--version" });
         if (std.mem.indexOf(u8, version, " 6.") != null) return path;
     }
     return null;
+}
+
+/// Compiles qimgv.rc (the Windows exe icon) into the COFF object the linker takes.
+/// windres resolves the .ico named inside the .rc relative to its working directory,
+/// so the command runs from qimgv/, where the "res/..." path exists.
+fn windowsResource(b: *std.Build) std.Build.LazyPath {
+    const windres = b.findProgram(.{ .names = &.{ "windres", "llvm-windres" } }) orelse
+        @panic("windres not found: install binutils (mingw-w64-x86_64-binutils)");
+    const run = b.addSystemCommand(&.{ windres, "-O", "coff", "-o" });
+    const out = run.addOutputFileArg("qimgv.rc.o");
+    run.setCwd(b.path("qimgv"));
+    run.addFileArg(b.path("qimgv/qimgv.rc"));
+    run.addFileInput(b.path("qimgv/res/icons/common/logo/app/qimgv.ico"));
+    return out;
 }
 
 fn installBinary(b: *std.Build, binary: std.Build.LazyPath, is_windows: bool, is_macos: bool) *std.Build.Step.InstallFile {

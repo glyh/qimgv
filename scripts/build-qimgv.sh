@@ -1,216 +1,96 @@
 #!/bin/bash
-# This builds a complete qimgv-x64 package. Result is placed in qimgv/qimgv-x64_<version>
-# Warning: Some stuff will be left over behind after building (C:/qt and C:/opencv-4.5.5-minimal)
+# Builds the Windows release archive (qimgv-x64.7z) from an MSYS2 UCRT64 shell.
+#
+# Qt 6 comes from MSYS2's mingw-w64-ucrt-x86_64-qt6-* packages and the C++ compiler is
+# MSYS2's gcc; zig only drives the build graph (see build.zig). The third-party
+# image-format plugins the Qt5-era script compiled (JXL/AVIF/APNG/HEIF/RAW) are not
+# built any more -- glyh/qimgv#23 tracks restoring them.
+set -euo pipefail
 
-#CFL='-ffunction-sections -fdata-sections -march=native -mtune=native -O3 -pipe'
-CFL='-ffunction-sections -fdata-sections -O3 -pipe'
-LDFL='-Wl,--gc-sections'
-
-if [[ -z "$RUNNER_TEMP" ]]; then
-  MSYS_DIR="C:/msys64/mingw64"
-else
-  MSYS_DIR="$(cd "$RUNNER_TEMP" && pwd)/msys64/mingw64"
+if [[ "${MSYSTEM:-}" != "UCRT64" && "${MSYSTEM:-}" != "MINGW64" && "${MSYSTEM:-}" != "CLANG64" ]]; then
+    echo "run this from an MSYS2 MinGW shell (MSYSTEM=UCRT64)" >&2
+    exit 1
 fi
-CUSTOM_QT_DIR="C:/qt/5.15.3-mingw64-slim"
-OPENCV_DIR="C:/opencv-minimal-4.5.5"
-SCRIPTS_DIR=$(dirname $(readlink -f $0)) # this file's location (/path/to/qimgv/scripts)
-SRC_DIR=$(dirname $SCRIPTS_DIR)
-BUILD_DIR=$SRC_DIR/build
-EXT_DIR=$SRC_DIR/_external
-rm -rf "$EXT_DIR"
-mkdir "$EXT_DIR"
-MPV_DIR=$EXT_DIR/mpv
+command -v zig >/dev/null || { echo "zig 0.17 must be on PATH" >&2; exit 1; }
 
-# ------------------------------------------------------------------------------
-echo "PREPARING BUILD DIR"
-rm -rf $BUILD_DIR
-mkdir -p $BUILD_DIR
-
-# ------------------------------------------------------------------------------
-echo "UPDATING DEPENDENCY LIST"
-wget --progress=dot:mega -O $BUILD_DIR/msys2-build-deps.txt https://raw.githubusercontent.com/easymodo/qimgv-deps-bin/main/msys2-build-deps.txt
-wget --progress=dot:mega -O $BUILD_DIR/msys2-dll-deps.txt https://raw.githubusercontent.com/easymodo/qimgv-deps-bin/main/msys2-dll-deps.txt
-
-# ------------------------------------------------------------------------------
-echo "INSTALLING MSYS2 BUILD DEPS"
-MSYS_DEPS=$(cat $BUILD_DIR/msys2-build-deps.txt | sed 's/\n/ /')
-pacman -S $MSYS_DEPS --noconfirm --needed
-
-# ------------------------------------------------------------------------------
-echo "GETTING Qt"
-mkdir C:/qt
-cd C:/qt
-wget --progress=dot:mega -O 5.15.3-mingw64-slim.7z https://github.com/easymodo/qt-builds/releases/download/5.15.3-mingw64-slim/5.15.3-mingw64-slim.7z
-7z x 5.15.3-mingw64-slim.7z -y
-rm 5.15.3-mingw64-slim.7z
-
-# ------------------------------------------------------------------------------
-echo "GETTING OpenCV"
-mkdir $OPENCV_DIR
-cd $OPENCV_DIR
-wget --progress=dot:mega -O opencv-minimal-4.5.5-x64.7z https://github.com/easymodo/qimgv-deps-bin/releases/download/x64/opencv-minimal-4.5.5-x64.7z
-7z x opencv-minimal-4.5.5-x64.7z -y
-rm opencv-minimal-4.5.5-x64.7z
-
-# ------------------------------------------------------------------------------
-echo "GETTING MPV"
-mkdir $MPV_DIR
-cd $MPV_DIR
-wget --progress=dot:mega -O mpv-x64.7z https://github.com/easymodo/qimgv-deps-bin/releases/download/x64/mpv-x86_64-20230402-git-0f13c38.7z
-7z x mpv-x64.7z -y
-rm mpv-x64.7z
-
-# ------------------------------------------------------------------------------
-# We are using prebuilt opencv but feel free to compile instead
-#echo "BUILDING OPENCV"
-#cd $EXT_DIR
-#git clone --depth 1 --branch 4.5.5 https://github.com/opencv/opencv.git
-#cd opencv
-#rm -rf ./build
-#cmake -S ./ -B build -G Ninja \
-#    -DCMAKE_INSTALL_PREFIX="$OPENCV_DIR" \
-#    -DCMAKE_BUILD_TYPE=Release \
-#    -DBUILD_LIST='core,imgproc' \
-#    -DWITH_1394=OFF \
-#    -DWITH_VTK=OFF \
-#    -DWITH_FFMPEG=OFF \
-#    -DWITH_GSTREAMER=OFF \
-#    -DWITH_DSHOW=OFF \
-#    -DWITH_QUIRC=OFF \
-#    -DBUILD_SHARED_LIBS=ON \
-#    -DCMAKE_C_FLAGS="$CFL" -DCMAKE_CXX_FLAGS="$CFL" -DCMAKE_EXE_LINKER_FLAGS="$LDFL"
-#ninja install -C build
+SRC_DIR=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+cd "$SRC_DIR"
 
 # ------------------------------------------------------------------------------
 echo "BUILDING"
-# NOTE: build.zig drives Qt 6 only (Qt5 support was dropped with the port), but this
-# script still provisions the Qt 5.15.3 tree above and packages Qt5*.dll below, and the
-# imageformat plugins below are still built for Qt5. The Windows backend therefore needs
-# a Qt6/MSYS2 provisioning path before this script produces a working package; that is
-# tracked separately as a CI-backend ticket. Linux and macOS are unaffected.
-# The build system is build.zig now (CMake was retired). zig is the driver; the C++
-# compile uses the toolchain's clang++/g++ because zig 0.17's frontend cannot parse a
-# modern libstdc++, see the comment at the top of build.zig.
-if ! command -v zig >/dev/null; then
-    echo "zig is required: install it (pacman -S zig) and re-run" >&2
+BUILD_DIR="$SRC_DIR/build"
+INSTALL_DIR="$BUILD_DIR/install"
+rm -rf "$BUILD_DIR"
+mkdir -p "$INSTALL_DIR"
+
+# opencv=false: MSYS2 ships OpenCV 5.0, which no longer installs opencv4.pc and whose
+# API the 3rdparty QtOpenCV shim predates. Linux still builds with opencv=true.
+zig build -Doptimize=ReleaseFast -Dexiv2=true -Dvideo=true -Dopencv=false \
+    --prefix "$INSTALL_DIR"
+
+# ------------------------------------------------------------------------------
+echo "ASSEMBLING PACKAGE"
+# Users download an archive whose root holds qimgv.exe, so bin/ is flattened here:
+# the install tree is bin/qimgv.exe, bin/plugins/, bin/translations/ and share/.
+# The fork's remote carries no tags, so describe has nothing to name; --always falls
+# back to the abbreviated commit rather than exiting 128 under set -e.
+BUILD_NAME="qimgv-x64_$(git describe --tags --always)"
+PACKAGE_DIR="$SRC_DIR/$BUILD_NAME"
+rm -rf "$PACKAGE_DIR"
+mkdir -p "$PACKAGE_DIR"
+
+cp "$INSTALL_DIR/bin/qimgv.exe" "$PACKAGE_DIR/"
+cp -r "$INSTALL_DIR/bin/plugins" "$PACKAGE_DIR/"
+cp -r "$INSTALL_DIR/bin/translations" "$PACKAGE_DIR/"
+cp -r "$INSTALL_DIR/share" "$PACKAGE_DIR/"
+cp -r "$SRC_DIR/qimgv/distrib/mimedata/data" "$PACKAGE_DIR/"
+mkdir -p "$PACKAGE_DIR/cache" "$PACKAGE_DIR/conf" "$PACKAGE_DIR/thumbnails"
+
+# Qt runtime and its plugins (platforms/, imageformats/, styles/, iconengines/, tls/).
+windeployqt --release --no-translations --no-compiler-runtime \
+    --no-system-d3d-compiler --no-opengl-sw \
+    --dir "$PACKAGE_DIR" "$PACKAGE_DIR/qimgv.exe"
+
+# Everything else the exe and the plugin pull in from MSYS2: mpv, exiv2, ffmpeg and the
+# MinGW runtime. ntldd walks the dependency tree; only DLLs under the MSYS2 prefix are
+# shipped. It prints Windows paths ("D:\...\ucrt64\bin\libmpv-2.dll"), so the prefix
+# match accepts either separator -- matching only '/' silently shipped a package with no
+# mpv and no MinGW runtime in it at all.
+collect_dlls() {
+    for exe in "$@"; do
+        ntldd -R "$exe" 2>/dev/null || true
+    done | awk '{print $3}' | grep -iE '[/\\](mingw64|ucrt64|clang64)[/\\]' | while read -r p; do
+        cygpath -u "$p"
+    done | sort -u
+}
+
+collected=$(collect_dlls "$PACKAGE_DIR/qimgv.exe" "$PACKAGE_DIR/plugins/player_mpv.dll" || true)
+if [ -z "$collected" ]; then
+    echo "ntldd resolved no MSYS2 DLLs to ship; is ntldd installed and on PATH?" >&2
     exit 1
 fi
-# OPENCV in the packaged layout is a prebuilt 4.5.5 tree; build.zig reaches it through
-# pkg-config, so point pkg-config at it before building.
-export PKG_CONFIG_PATH="$OPENCV_DIR/x64/mingw/lib/pkgconfig:$PKG_CONFIG_PATH"
-zig build -Doptimize=ReleaseFast -Dopencv=true -Dvideo=true --prefix "$BUILD_DIR/install"
 
-echo "BUILDING IMAGEFORMATS"
-# We are using libjxl from MSYS2 but feel free to compile instead
-#cd $EXT_DIR
-#git clone --depth 1 https://github.com/libjxl/libjxl.git --recursive
-#cd libjxl
-#rm -rf build
-#cmake -S . -B build -G "Ninja" \
-#    -DCMAKE_INSTALL_PREFIX=$MSYS_DIR \
-#    -DCMAKE_BUILD_TYPE=Release -DJPEGXL_ENABLE_PLUGINS=OFF \
-#    -DBUILD_TESTING=OFF -DJPEGXL_WARNINGS_AS_ERRORS=OFF \
-#    -DJPEGXL_ENABLE_SJPEG=OFF -DJPEGXL_ENABLE_BENCHMARK=OFF \
-#    -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
-#    -DJPEGXL_FORCE_SYSTEM_BROTLI=ON
-#ninja install -C build
+while IFS= read -r dll; do
+    [ -f "$dll" ] || continue
+    cp -n "$dll" "$PACKAGE_DIR/" 2>/dev/null || true
+done <<< "$collected"
 
-# qt-jpegxl-image-plugin
-cd $EXT_DIR
-git clone --depth 1 https://github.com/novomesk/qt-jpegxl-image-plugin.git
-cd qt-jpegxl-image-plugin
-rm -rf build
-cmake -S . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DQT_MAJOR_VERSION=5 \
-    -DCMAKE_PREFIX_PATH=$CUSTOM_QT_DIR
-ninja -C build
-
-# qt-avif-image-plugin
-cd $EXT_DIR
-git clone https://github.com/novomesk/qt-avif-image-plugin
-cd qt-avif-image-plugin
-rm -rf build
-cmake -S . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DQT_MAJOR_VERSION=5 \
-    -DCMAKE_PREFIX_PATH=$CUSTOM_QT_DIR
-ninja -C build
-
-# QtApng
-cd $EXT_DIR
-git clone https://github.com/Skycoder42/QtApng.git
-cd QtApng
-rm -rf build
-mkdir build && cd build
-$CUSTOM_QT_DIR/bin/qmake.exe ..
-mingw32-make -j4
-
-# qt-heif-image-plugin
-cd $EXT_DIR
-git clone https://github.com/jakar/qt-heif-image-plugin.git
-cd qt-heif-image-plugin
-rm -rf build
-cmake -S . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH=$CUSTOM_QT_DIR
-ninja -C build
-
-# qtraw
-cd $EXT_DIR
-git clone https://gitlab.com/mardy/qtraw
-cd qtraw
-rm -rf build
-mkdir build && cd build
-$CUSTOM_QT_DIR/bin/qmake.exe .. DEFINES+="LIBRAW_WIN32_CALLS=1"
-mingw32-make -j4
+# A missing runtime DLL here is an archive that cannot start on a clean machine, so say
+# so loudly rather than shipping it.
+missing=""
+while IFS= read -r dll; do
+    [ -n "$dll" ] || continue
+    [ -f "$PACKAGE_DIR/$(basename "$dll")" ] || missing="$missing $(basename "$dll")"
+done <<< "$collected"
+if [ -n "$missing" ]; then
+    echo "PACKAGE INCOMPLETE, missing:$missing" >&2
+    exit 1
+fi
+echo "  shipped $(printf '%s\n' "$collected" | wc -l) MSYS2 runtime DLLs"
 
 # ------------------------------------------------------------------------------
 echo "PACKAGING"
-# 0 - prepare dir
-cd $SRC_DIR
-BUILD_NAME=qimgv-x64_$(git describe --tags)
-PACKAGE_DIR=$SRC_DIR/$BUILD_NAME
-rm -rf $PACKAGE_DIR
-mkdir $PACKAGE_DIR
-
-# 1 - copy qimgv build
-cp $BUILD_DIR/install/bin/qimgv.exe $PACKAGE_DIR
-mkdir -p $PACKAGE_DIR/plugins
-cp $BUILD_DIR/install/bin/plugins/player_mpv.dll $PACKAGE_DIR/plugins
-cp -r $BUILD_DIR/install/bin/translations/ $PACKAGE_DIR/
-
-# 2 - copy qt dlls
-cd $CUSTOM_QT_DIR/bin
-cp Qt5Core.dll Qt5Gui.dll Qt5PrintSupport.dll Qt5Svg.dll Qt5Widgets.dll $PACKAGE_DIR
-cd $CUSTOM_QT_DIR/plugins
-cp -r iconengines imageformats printsupport styles $PACKAGE_DIR
-mkdir $PACKAGE_DIR/platforms
-cp platforms/qwindows.dll $PACKAGE_DIR/platforms
-
-# 3 - copy msys dlls
-MSYS_DLLS=$(cat $BUILD_DIR/msys2-dll-deps.txt | sed 's/\n/ /')
-cd $MSYS_DIR/bin
-cp $MSYS_DLLS $PACKAGE_DIR
-
-# 4 - copy imageformats
-cp $EXT_DIR/qt-jpegxl-image-plugin/build/bin/imageformats/libqjpegxl5.dll $PACKAGE_DIR/imageformats
-cp $EXT_DIR/qt-avif-image-plugin/build/bin/imageformats/libqavif5.dll $PACKAGE_DIR/imageformats
-cp $EXT_DIR/QtApng/build/plugins/imageformats/qapng.dll $PACKAGE_DIR/imageformats
-cp $EXT_DIR/qt-heif-image-plugin/build/bin/imageformats/libqheif.dll $PACKAGE_DIR/imageformats
-cp $EXT_DIR/qtraw/build/src/imageformats/qtraw.dll $PACKAGE_DIR/imageformats
-
-# 5 - copy opencv & mpv
-cd $OPENCV_DIR/x64/mingw/bin
-cp libopencv_core455.dll libopencv_imgproc455.dll $PACKAGE_DIR
-cd $MPV_DIR/bin/x86_64
-cp mpv.exe libmpv-2.dll $PACKAGE_DIR
-
-# 6 - misc
-mkdir $PACKAGE_DIR/cache
-mkdir $PACKAGE_DIR/conf
-mkdir $PACKAGE_DIR/thumbnails
-cp -r $SRC_DIR/qimgv/distrib/mimedata/data $PACKAGE_DIR
-
-cd $SRC_DIR
-echo "PACKAGING DONE"
+cd "$SRC_DIR"
+rm -f qimgv-x64.7z
+7z a qimgv-x64.7z "./$BUILD_NAME"
+echo "PACKAGING DONE: $SRC_DIR/qimgv-x64.7z"
