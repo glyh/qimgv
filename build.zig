@@ -469,18 +469,35 @@ fn pkgConfigVar(b: *std.Build, variable: []const u8, module: []const u8) []const
 fn qtTool(b: *std.Build, name: []const u8) ?[]const u8 {
     const io = b.graph.io;
     const prefix = pkgConfigVar(b, "prefix", "Qt6Core");
-    const dirs = [_][]const u8{
+    var dirs: std.ArrayList([]const u8) = .empty;
+    // Qt only defines host_bins for cross builds, but when it is there it is the
+    // authoritative answer.
+    const host_bins = pkgConfigVar(b, "host_bins", "Qt6Core");
+    if (host_bins.len != 0) dirs.append(b.allocator, host_bins) catch @panic("OOM");
+    // bindir/libexecdir are what Homebrew and Debian point at the tools.
+    const bindir = pkgConfigVar(b, "bindir", "Qt6Core");
+    if (bindir.len != 0) dirs.append(b.allocator, bindir) catch @panic("OOM");
+    const libexecdir = pkgConfigVar(b, "libexecdir", "Qt6Core");
+    if (libexecdir.len != 0) dirs.append(b.allocator, libexecdir) catch @panic("OOM");
+    dirs.appendSlice(b.allocator, &.{
         b.fmt("{s}/lib/qt6", .{prefix}),
         b.fmt("{s}/lib/qt6/bin", .{prefix}),
         b.fmt("{s}/lib/qt6/libexec", .{prefix}),
+        // MSYS2 keeps moc/uic/rcc in share/qt6/bin rather than bin/.
+        b.fmt("{s}/share/qt6/bin", .{prefix}),
         b.fmt("{s}/libexec", .{prefix}),
         b.fmt("{s}/bin", .{prefix}),
-    };
-    for (dirs) |dir| {
-        const candidate = b.fmt("{s}/{s}", .{ dir, name });
-        if (std.Io.Dir.cwd().access(io, candidate, .{})) |_| return candidate else |_| {}
+    }) catch @panic("OOM");
+    // Windows tools are moc.exe/uic.exe/...; without the extensioned name every
+    // prefix lookup misses and only the PATH fallback below can save it.
+    const names = [_][]const u8{ name, b.fmt("{s}.exe", .{name}) };
+    for (dirs.items) |dir| {
+        for (names) |candidate_name| {
+            const candidate = b.fmt("{s}/{s}", .{ dir, candidate_name });
+            if (std.Io.Dir.cwd().access(io, candidate, .{})) |_| return candidate else |_| {}
+        }
     }
-    if (b.findProgram(.{ .names = &.{name} })) |path| {
+    if (b.findProgram(.{ .names = &names })) |path| {
         const version = b.run(&.{ path, "--version" });
         if (std.mem.indexOf(u8, version, " 6.") != null) return path;
     }
