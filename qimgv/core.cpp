@@ -6,6 +6,7 @@
  */
 
 #include "core.h"
+#include "utils/bench.h"
 
 #ifdef __WIN32
 #include <tchar.h>
@@ -49,6 +50,7 @@ void Core::readSettings() {
 void Core::showGui() {
     if(mw && !mw->isVisible())
         mw->showDefault();
+    Bench::mark("window-shown");
     // TODO: this is unreliable.
     // how to make it wait until a window is shown?
     qApp->processEvents();

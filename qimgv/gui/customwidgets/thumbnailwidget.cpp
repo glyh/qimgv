@@ -1,4 +1,5 @@
 #include "thumbnailwidget.h"
+#include "utils/bench.h"
 
 #include <QTimer>
 
@@ -114,6 +115,7 @@ QSizeF ThumbnailWidget::effectiveSizeHint(Qt::SizeHint which, const QSizeF &cons
 
 void ThumbnailWidget::setThumbnail(std::shared_ptr<Thumbnail> _thumbnail) {
     if(_thumbnail) {
+        Bench::mark("first-thumbnail");
         thumbnail = _thumbnail;
         isLoaded = true;
         updateThumbnailDrawPosition();

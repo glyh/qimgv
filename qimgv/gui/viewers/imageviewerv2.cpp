@@ -1,4 +1,5 @@
 #include "imageviewerv2.h"
+#include "utils/bench.h"
 
 ImageViewerV2::ImageViewerV2(QWidget *parent) : QGraphicsView(parent),
     pixmap(nullptr),
@@ -56,6 +57,7 @@ ImageViewerV2::ImageViewerV2(QWidget *parent) : QGraphicsView(parent),
     scaleTimer = new QTimer(this);
     scaleTimer->setSingleShot(true);
     scaleTimer->setInterval(80);
+    Bench::watchViewer(this);
 
     checkboard = new QPixmap(":res/icons/common/other/checkerboard.png");
 
@@ -280,6 +282,7 @@ void ImageViewerV2::updatePixmap(std::unique_ptr<QPixmap> newPixmap) {
     pixmapItem.setPixmap(*pixmap);
     pixmapItem.show();
     pixmapItem.update();
+    Bench::imageShown(2);
 }
 
 void ImageViewerV2::showAnimation(std::shared_ptr<QMovie> _movie) {
@@ -338,6 +341,7 @@ void ImageViewerV2::showImage(std::unique_ptr<QPixmap> _pixmap) {
                 applySavedViewportPos();
         }
         requestScaling();
+        Bench::imageShown(1);
         update();
     }
 }

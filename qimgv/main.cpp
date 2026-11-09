@@ -12,6 +12,7 @@
 #include "sharedresources.h"
 #include "proxystyle.h"
 #include "core.h"
+#include "utils/bench.h"
 
 #ifdef __APPLE__
 #include "macosapplication.h"
@@ -78,6 +79,7 @@ int main(int argc, char *argv[]) {
     // use some style workarounds
     a.setStyle(new ProxyStyle);
 #endif
+    Bench::start();
 
     QCoreApplication::setOrganizationName("qimgv");
     QCoreApplication::setOrganizationDomain("github.com/easymodo/qimgv");

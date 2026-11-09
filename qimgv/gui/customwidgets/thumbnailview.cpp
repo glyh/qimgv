@@ -1,4 +1,5 @@
 #include "thumbnailview.h"
+#include "utils/bench.h"
 
 ThumbnailView::ThumbnailView(Qt::Orientation _orientation, QWidget *parent)
     : QGraphicsView(parent),
@@ -25,6 +26,7 @@ ThumbnailView::ThumbnailView(Qt::Orientation _orientation, QWidget *parent)
 
     setOrientation(_orientation);
 
+    Bench::watchGrid(this);
     lastTouchpadScroll.start();
 
     connect(&loadTimer, &QTimer::timeout, this, &ThumbnailView::loadVisibleThumbnails);
