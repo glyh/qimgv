@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     // (QFile::copy takes std::optional<Permissions>), so libc++-mangled symbols never
     // resolve at link time. C++ therefore compiles with the system compiler; zig owns
     // the graph, the moc/uic/rcc steps, caching and the install tree.
-    const cxx = systemCxx(b) orelse @panic("no C++ compiler found: install clang or gcc");
+    const cxx = systemCxx(b, is_windows) orelse @panic("no C++ compiler found: install clang or gcc");
 
     var flags: std.ArrayList([]const u8) = .empty;
     const add = std.ArrayList([]const u8).appendSlice;
@@ -441,9 +441,16 @@ fn optimizeFlags(optimize: std.builtin.Optimize) []const []const u8 {
     };
 }
 
-fn systemCxx(b: *std.Build) ?[]const u8 {
-    if (b.findProgram(.{ .names = &.{"clang++"} })) |path| return path;
-    if (b.findProgram(.{ .names = &.{"g++"} })) |path| return path;
+/// On Windows prefer MinGW's g++: the runner images carry an LLVM clang++ on PATH
+/// that targets x86_64-pc-windows-msvc and rejects flags this build passes it.
+fn systemCxx(b: *std.Build, prefer_gcc: bool) ?[]const u8 {
+    const order = if (prefer_gcc)
+        [_][]const u8{ "g++", "clang++" }
+    else
+        [_][]const u8{ "clang++", "g++" };
+    for (order) |name| {
+        if (b.findProgram(.{ .names = &.{name} })) |path| return path;
+    }
     return null;
 }
 
