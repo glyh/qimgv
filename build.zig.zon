@@ -1,0 +1,12 @@
+.{
+    .name = .qimgv,
+    .version = "1.0.2",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0x976bf7f108de017a,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "qimgv",
+        "plugins",
+    },
+}
